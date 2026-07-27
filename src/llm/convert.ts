@@ -364,11 +364,12 @@ function decodeClaudeRequest(raw: unknown): LLMRequest {
         parts.push({ text: item.text });
       } else if (item.type === 'image' || item.type === 'document') {
         const source = item.source;
-        if (source?.type === 'base64' && typeof source.media_type === 'string' && typeof source.data === 'string') {
+        // Claude 的纯文本文档用 source.type='text'（明文），unified inlineData 统一存 base64。
+        if ((source?.type === 'base64' || source?.type === 'text') && typeof source.media_type === 'string' && typeof source.data === 'string') {
           parts.push({
             inlineData: {
               mimeType: source.media_type,
-              data: source.data,
+              data: source.type === 'text' ? utf8ToBase64(source.data) : source.data,
             },
           });
         }

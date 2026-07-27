@@ -13,7 +13,7 @@ import { FormatAdapter, StreamDecodeState } from './types.js';
 import { consumeCallId, normalizeCallId, resolveCallId } from './tool-call-ids.js';
 import { sanitizeSchemaForClaude } from './schema-sanitizer.js';
 import { mapClaudeThinkingLevel } from './thinking-level.js';
-import { isToolResponseDocumentMimeType, isToolResponseImageMimeType } from '../vision.js';
+import { isToolResponseImageMimeType } from '../vision.js';
 
 interface NormalizedClaudePromptCacheConfig {
   enabled: boolean;
@@ -125,16 +125,11 @@ export class ClaudeFormat implements FormatAdapter {
             if (isTextPart(part) && part.thought !== true && part.text) {
               contentBlocks.push({ type: 'text', text: part.text });
             } else if (isInlineDataPart(part)) {
-              hasStructuredContent = true;
-              const mime = part.inlineData.mimeType;
-              contentBlocks.push({
-                type: 'document',
-                source: {
-                  type: 'base64',
-                  media_type: mime,
-                  data: part.inlineData.data,
-                },
-              });
+              const mediaBlock = encodeClaudeMediaBlock(part.inlineData);
+              if (mediaBlock) {
+                hasStructuredContent = true;
+                contentBlocks.push(mediaBlock);
+              }
             }
           }
 
@@ -539,29 +534,65 @@ function encodeClaudeToolResultContent(response: FunctionResponsePart['functionR
 }
 
 function encodeClaudeToolResultMediaBlock(part: NonNullable<FunctionResponsePart['functionResponse']['parts']>[number]): Record<string, unknown> | undefined {
-  const inlineData = part.inlineData;
-  const mime = inlineData.mimeType;
+  return encodeClaudeMediaBlock(part.inlineData);
+}
+
+/**
+ * 把 unified inlineData 编码成 Claude content block。
+ *
+ * Anthropic 对 block 类型的要求非常严格：
+ * - 图片必须用 `image` block；
+ * - `document` + `source.type: 'base64'` 只接受 `application/pdf`，
+ *   传其它 media_type 会直接被拒：
+ *   `document.source.base64.media_type: Input should be 'application/pdf'`；
+ * - 纯文本文档要用 `source.type: 'text'`，data 为明文而非 base64。
+ *
+ * 无法原生表达的 MIME 返回 undefined，由调用方丢弃，避免整个请求 400。
+ */
+function encodeClaudeMediaBlock(inlineData: { mimeType?: string; data?: string }): Record<string, unknown> | undefined {
+  const mime = inlineData.mimeType?.toLowerCase();
+  const data = inlineData.data;
+  if (!mime || !data) return undefined;
+
   if (isToolResponseImageMimeType(mime)) {
     return {
       type: 'image',
       source: {
         type: 'base64',
         media_type: mime,
-        data: inlineData.data,
+        data,
       },
     };
   }
-  if (isToolResponseDocumentMimeType(mime)) {
+
+  if (mime === 'application/pdf') {
     return {
       type: 'document',
       source: {
         type: 'base64',
-        media_type: mime,
-        data: inlineData.data,
+        media_type: 'application/pdf',
+        data,
       },
     };
   }
+
+  if (mime === 'text/plain') {
+    return {
+      type: 'document',
+      source: {
+        type: 'text',
+        media_type: 'text/plain',
+        data: base64ToUtf8(data),
+      },
+    };
+  }
+
   return undefined;
+}
+
+/** text/plain 文档在 unified 里是 base64，Claude 的 text source 需要明文。 */
+function base64ToUtf8(data: string): string {
+  return Buffer.from(data, 'base64').toString('utf8');
 }
 
 

@@ -57,7 +57,7 @@ describe('format bridge', () => {
     expect(raw.contents[0].parts[0].thoughtSignature).toBe('openai-responses:enc_sig_1');
   });
 
-  it('base64 文件可在 Claude 与 unified 之间互转，不按 MIME 做图片判断', () => {
+  it('base64 图片在 Claude 用 image block 而非 document，并可与 unified 互转', () => {
     const unified = {
       contents: [{
         role: 'user',
@@ -74,16 +74,19 @@ describe('format bridge', () => {
       model: 'claude-sonnet-4',
     }) as any;
 
-    const documentBlock = claude.messages[0].content.find((block: any) => block.type === 'document');
-    expect(documentBlock).toMatchObject({
-      type: 'document',
+    // Claude 的 base64 document block 只接受 application/pdf，图片必须走 image block。
+    expect(claude.messages[0].content.some((block: any) => block.type === 'document')).toBe(false);
+
+    const imageBlock = claude.messages[0].content.find((block: any) => block.type === 'image');
+    expect(imageBlock).toMatchObject({
+      type: 'image',
       source: {
         type: 'base64',
         media_type: 'image/jpeg',
         data: 'aW1n',
       },
     });
-    expect(documentBlock.title).toBeUndefined();
+    expect(imageBlock.title).toBeUndefined();
 
     const roundTrip = convertRequest(claude, {
       from: 'claude',
@@ -95,6 +98,62 @@ describe('format bridge', () => {
       mimeType: 'image/jpeg',
       data: 'aW1n',
     });
+  });
+
+  it('Claude user 消息按 MIME 分流 image / document，并过滤不支持的 inlineData', () => {
+    const claude = convertRequest({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: '看看这些附件' },
+          { inlineData: { mimeType: 'image/png', data: 'aW1n', name: 'shot.png' } },
+          { inlineData: { mimeType: 'application/pdf', data: 'JVBERi0=', name: 'paper.pdf' } },
+          { inlineData: { mimeType: 'text/plain', data: 'aGVsbG8=', name: 'note.txt' } },
+          { inlineData: { mimeType: 'audio/wav', data: 'UklGRg==', name: 'voice.wav' } },
+        ],
+      }],
+    }, { from: 'unified', to: 'claude', model: 'claude-sonnet-4' }) as any;
+
+    expect(claude.messages[0].content).toEqual([
+      { type: 'text', text: '看看这些附件' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1n' } },
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+      { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'hello' } },
+    ]);
+  });
+
+  it('Claude user 消息的 text/plain 文档可往返回 unified base64', () => {
+    const claude = convertRequest({
+      contents: [{
+        role: 'user',
+        parts: [{ inlineData: { mimeType: 'text/plain', data: 'aGVsbG8=' } }],
+      }],
+    }, { from: 'unified', to: 'claude', model: 'claude-sonnet-4' }) as any;
+
+    const roundTrip = convertRequest(claude, {
+      from: 'claude',
+      to: 'unified',
+      model: 'claude-sonnet-4',
+    }) as any;
+
+    expect(roundTrip.contents[0].parts[0].inlineData).toEqual({
+      mimeType: 'text/plain',
+      data: 'aGVsbG8=',
+    });
+  });
+
+  it('Claude user 消息里全部 inlineData 都不支持时退回纯文本', () => {
+    const claude = convertRequest({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: '听一下' },
+          { inlineData: { mimeType: 'audio/wav', data: 'UklGRg==' } },
+        ],
+      }],
+    }, { from: 'unified', to: 'claude', model: 'claude-sonnet-4' }) as any;
+
+    expect(claude.messages[0].content).toBe('听一下');
   });
 
   it('OpenAI-compatible 发送图片 image_url 和文档 file，并过滤其它 inlineData', () => {
@@ -216,6 +275,32 @@ describe('format bridge', () => {
         type: 'document',
         source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' },
       },
+    ]);
+  });
+
+  it('工具响应里的 text/plain 在 Claude 用 text source 而非 base64', () => {
+    const raw = convertRequest({
+      contents: [
+        { role: 'model', parts: [{ functionCall: { name: 'read_file', args: {}, callId: 'toolu_1' } }] },
+        {
+          role: 'user',
+          parts: [{
+            functionResponse: {
+              name: 'read_file',
+              callId: 'toolu_1',
+              response: { ok: true },
+              parts: [
+                { inlineData: { mimeType: 'text/plain', data: 'aGVsbG8=' } },
+              ],
+            },
+          }],
+        },
+      ],
+    }, { from: 'unified', to: 'claude', model: 'claude-sonnet-4' }) as any;
+
+    expect(raw.messages[1].content[0].content).toEqual([
+      { type: 'text', text: '{"ok":true}' },
+      { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'hello' } },
     ]);
   });
 
