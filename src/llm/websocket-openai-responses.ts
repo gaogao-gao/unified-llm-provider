@@ -9,19 +9,18 @@
  */
 
 import { createHash } from 'node:crypto';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import WebSocket, { type RawData } from 'ws';
+import { getGlobalDispatcher, WebSocket as UndiciWebSocket } from 'undici';
 import type { LLMProxyOption } from '../config/types.js';
 import type { LLMRawErrorInfo, LLMRequest, LLMResponse, LLMStreamChunk } from '../types.js';
 import type { FormatAdapter } from './formats/types.js';
-import type { EndpointConfig } from './transport.js';
+import { getProxyDispatcher, type EndpointConfig } from './transport.js';
 
 const OPENAI_RESPONSES_WS_MAX_AGE_MS = 55 * 60 * 1000;
 
 interface WebSocketSession {
   key: string;
   connectionFingerprint: string;
-  socket?: WebSocket;
+  socket?: UndiciWebSocket;
   connectedAt?: number;
   previousResponseId?: string;
   serverInputItems?: unknown[];
@@ -66,7 +65,6 @@ interface NormalizedWebSocketProxy {
 }
 
 const sessions = new Map<string, WebSocketSession>();
-const webSocketProxyAgents = new Map<string, HttpsProxyAgent<string>>();
 let statelessSessionCounter = 0;
 
 export async function* streamOpenAIResponsesWebSocket(
@@ -300,10 +298,10 @@ async function ensureOpenSocket(
   session: WebSocketSession,
   options: OpenAIResponsesWebSocketStreamOptions,
   forceNew: boolean,
-): Promise<WebSocket> {
-  if (forceNew || isSessionExpired(session) || !isSocketOpen(session.socket)) {
+): Promise<UndiciWebSocket> {
+  const expired = isSessionExpired(session);
+  if (forceNew || expired || !isSocketOpen(session.socket)) {
     closeSessionSocket(session);
-    const expired = isSessionExpired(session);
     session.socket = await openSocket(options);
     session.connectedAt = Date.now();
     if (forceNew || expired) invalidateSessionState(session);
@@ -311,33 +309,32 @@ async function ensureOpenSocket(
   return session.socket!;
 }
 
-async function openSocket(options: OpenAIResponsesWebSocketStreamOptions): Promise<WebSocket> {
+async function openSocket(options: OpenAIResponsesWebSocketStreamOptions): Promise<UndiciWebSocket> {
   const wsUrl = toWebSocketUrl(options.endpoint.webSocketUrl ?? options.url);
   const headers = webSocketHeaders(options.headers);
-  const agent = webSocketProxyAgent(options.endpoint.proxy);
+  const normalizedProxy = normalizeWebSocketProxy(options.endpoint.proxy);
+  const baseDispatcher = normalizedProxy
+    ? assertWebSocketDispatcher(await getProxyDispatcher(options.endpoint.proxy))
+    : getGlobalDispatcher();
+  const dispatcher = webSocketNoCompressionDispatcher(baseDispatcher);
 
-  return new Promise<WebSocket>((resolve, reject) => {
+  return new Promise<UndiciWebSocket>((resolve, reject) => {
     if (options.signal?.aborted) {
       reject(errorFromAbortSignal(options.signal));
       return;
     }
 
     let settled = false;
-    const ws = new WebSocket(wsUrl, {
+    const ws = new UndiciWebSocket(wsUrl, {
       headers,
-      // 小 delta 帧启用 permessage-deflate 后会在 VS Code Extension Host 中逐帧异步解压，
-      // 即使 TCP 数据已经全部到达，也可能形成约 200ms/帧的派发节拍。
-      perMessageDeflate: false,
-      ...(agent ? { agent } : {}),
-      // 与现有显式代理调试能力保持一致，允许抓包代理替换目标站点证书。
-      rejectUnauthorized: options.endpoint.proxy ? false : undefined,
+      dispatcher: dispatcher as never,
     });
 
     const cleanup = () => {
       options.signal?.removeEventListener('abort', onAbort);
-      ws.off('open', onOpen);
-      ws.off('error', onError);
-      ws.off('close', onClose);
+      ws.removeEventListener('open', onOpen as never);
+      ws.removeEventListener('error', onError as never);
+      ws.removeEventListener('close', onClose as never);
     };
     const finishResolve = () => {
       if (settled) return;
@@ -354,20 +351,20 @@ async function openSocket(options: OpenAIResponsesWebSocketStreamOptions): Promi
     };
     const onAbort = () => finishReject(errorFromAbortSignal(options.signal!));
     const onOpen = () => finishResolve();
-    const onError = (error: Error) => finishReject(error);
-    const onClose = (code: number, reason: Buffer) => finishReject(
-      new Error(`OpenAI Responses WebSocket closed before open: ${code} ${reason.toString('utf8')}`.trim()),
+    const onError = (event: Event) => finishReject(errorFromEvent(event));
+    const onClose = (event: CloseEvent) => finishReject(
+      new Error(`OpenAI Responses WebSocket closed before open: ${event.code} ${event.reason}`.trim()),
     );
 
     options.signal?.addEventListener('abort', onAbort, { once: true });
-    ws.once('open', onOpen);
-    ws.once('error', onError);
-    ws.once('close', onClose);
+    ws.addEventListener('open', onOpen as never, { once: true });
+    ws.addEventListener('error', onError as never, { once: true });
+    ws.addEventListener('close', onClose as never, { once: true });
   });
 }
 
 async function* sendCreateAndReadEvents(
-  socket: WebSocket,
+  socket: UndiciWebSocket,
   payload: Record<string, unknown>,
   signal?: AbortSignal,
 ): AsyncGenerator<unknown> {
@@ -376,39 +373,40 @@ async function* sendCreateAndReadEvents(
 
   const cleanup = () => {
     signal?.removeEventListener('abort', onAbort);
-    socket.off('message', onMessage);
-    socket.off('error', onError);
-    socket.off('close', onClose);
+    socket.removeEventListener('message', onMessage as never);
+    socket.removeEventListener('error', onError as never);
+    socket.removeEventListener('close', onClose as never);
   };
   const finish = () => {
     terminalSeen = true;
     queue.end();
   };
   const onAbort = () => {
+    const error = errorFromAbortSignal(signal!);
     try { socket.close(); } catch { /* noop */ }
-    queue.fail(errorFromAbortSignal(signal!));
+    queue.fail(error);
   };
-  const onMessage = (data: RawData) => {
-    const parsed = parseWebSocketData(data);
+  const onMessage = (event: MessageEvent) => {
+    const parsed = parseWebSocketData(event.data);
     if (!parsed.ok) {
-      queue.push(createErrorPayload('stream_parse_error', parsed.error.message, data));
+      queue.push(createErrorPayload('stream_parse_error', parsed.error.message, event.data));
       finish();
       return;
     }
     queue.push(parsed.value);
     if (isTerminalEvent(parsed.value)) finish();
   };
-  const onError = (error: Error) => queue.fail(error);
-  const onClose = (code: number, reason: Buffer) => {
+  const onError = (event: Event) => queue.fail(errorFromEvent(event));
+  const onClose = (event: CloseEvent) => {
     if (terminalSeen) return;
-    queue.fail(new Error(`OpenAI Responses WebSocket closed: ${code} ${reason.toString('utf8')}`.trim()));
+    queue.fail(new Error(`OpenAI Responses WebSocket closed: ${event.code} ${event.reason}`.trim()));
   };
 
   if (signal?.aborted) throw errorFromAbortSignal(signal);
   signal?.addEventListener('abort', onAbort, { once: true });
-  socket.on('message', onMessage);
-  socket.once('error', onError);
-  socket.once('close', onClose);
+  socket.addEventListener('message', onMessage as never);
+  socket.addEventListener('error', onError as never, { once: true });
+  socket.addEventListener('close', onClose as never, { once: true });
 
   try {
     socket.send(JSON.stringify(payload));
@@ -574,8 +572,8 @@ function invalidateSessionState(session: WebSocketSession): void {
   session.baseSignature = undefined;
 }
 
-function isSocketOpen(socket: WebSocket | undefined): boolean {
-  return !!socket && socket.readyState === WebSocket.OPEN;
+function isSocketOpen(socket: UndiciWebSocket | undefined): boolean {
+  return !!socket && socket.readyState === UndiciWebSocket.OPEN;
 }
 
 function webSocketHeaders(headers: Record<string, string>): Record<string, string> {
@@ -588,18 +586,51 @@ function webSocketHeaders(headers: Record<string, string>): Record<string, strin
   return result;
 }
 
-function webSocketProxyAgent(proxy?: LLMProxyOption): HttpsProxyAgent<string> | undefined {
-  const normalized = normalizeWebSocketProxy(proxy);
-  if (!normalized) return undefined;
-  const cached = webSocketProxyAgents.get(normalized.cacheKey);
+type WebSocketDispatcher = ReturnType<typeof getGlobalDispatcher>;
+type WebSocketDispatch = WebSocketDispatcher['dispatch'];
+interface WebSocketDispatchOnly {
+  dispatch: WebSocketDispatch;
+}
+
+const noCompressionDispatcherCache = new WeakMap<object, WebSocketDispatchOnly>();
+
+function assertWebSocketDispatcher(value: unknown): WebSocketDispatcher {
+  if (!value || typeof value !== 'object' || typeof (value as { dispatch?: unknown }).dispatch !== 'function') {
+    throw new Error('WebSocket proxy dispatcher could not be created.');
+  }
+  return value as WebSocketDispatcher;
+}
+
+function webSocketNoCompressionDispatcher(base: WebSocketDispatcher): WebSocketDispatchOnly {
+  const cacheKey = base as object;
+  const cached = noCompressionDispatcherCache.get(cacheKey);
   if (cached) return cached;
 
-  const agent = new HttpsProxyAgent(normalized.uri, {
-    ...(normalized.headers ? { headers: normalized.headers } : {}),
-    rejectUnauthorized: false,
-  });
-  webSocketProxyAgents.set(normalized.cacheKey, agent);
-  return agent;
+  const dispatch: WebSocketDispatch = (options, handler) => {
+    const headers = stripWebSocketCompressionHeader(options.headers);
+    return base.dispatch({ ...options, headers: headers as typeof options.headers }, handler);
+  };
+  const wrapped = { dispatch };
+  noCompressionDispatcherCache.set(cacheKey, wrapped);
+  return wrapped;
+}
+
+function stripWebSocketCompressionHeader(headers: unknown): unknown {
+  if (Array.isArray(headers)) {
+    const result = [...headers];
+    for (let index = result.length - 2; index >= 0; index -= 2) {
+      if (String(result[index]).toLowerCase() === 'sec-websocket-extensions') {
+        result.splice(index, 2);
+      }
+    }
+    return result;
+  }
+  if (!headers || typeof headers !== 'object') return headers;
+  const result: Record<string, unknown> = { ...(headers as Record<string, unknown>) };
+  for (const key of Object.keys(result)) {
+    if (key.toLowerCase() === 'sec-websocket-extensions') delete result[key];
+  }
+  return result;
 }
 
 function normalizeWebSocketProxy(proxy?: LLMProxyOption): NormalizedWebSocketProxy | undefined {
@@ -808,6 +839,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function stringifyError(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+function errorFromEvent(event: Event): Error {
+  const maybe = event as Event & { error?: unknown; message?: unknown };
+  if (maybe.error instanceof Error) return maybe.error;
+  if (typeof maybe.message === 'string' && maybe.message) return new Error(maybe.message);
+  return new Error(event.type || 'WebSocket error');
 }
 
 function errorFromAbortSignal(signal: AbortSignal): Error {
