@@ -1,4 +1,6 @@
 import { once } from 'node:events';
+import * as http from 'node:http';
+import * as net from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
 import { streamOpenAIResponsesWebSocket } from '../src/llm/websocket-openai-responses.js';
@@ -68,5 +70,89 @@ describe('OpenAI Responses WebSocket ws transport', () => {
     expect(text).toBe('0123456789'.repeat(5));
     expect(negotiatedExtensions).toBe('');
     expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('reconnects when the proxy configuration changes for the same session key', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('WebSocket test server did not expose a TCP port');
+
+    let targetConnectionCount = 0;
+    server.on('connection', (socket) => {
+      targetConnectionCount += 1;
+      socket.on('message', () => {
+        socket.send(JSON.stringify({
+          type: 'response.output_text.delta',
+          response_id: `resp_proxy_${targetConnectionCount}`,
+          item_id: `msg_proxy_${targetConnectionCount}`,
+          output_index: 0,
+          content_index: 0,
+          delta: 'ok',
+        }));
+        socket.send(JSON.stringify({
+          type: 'response.completed',
+          response: { id: `resp_proxy_${targetConnectionCount}`, output: [] },
+        }));
+      });
+    });
+
+    let proxyConnectCount = 0;
+    const proxyServer = http.createServer();
+    proxyServer.on('connect', (request, clientSocket, head) => {
+      const targetUrl = new URL(`http://${request.url ?? ''}`);
+      proxyConnectCount += 1;
+      const upstream = net.connect(Number(targetUrl.port), targetUrl.hostname, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+      });
+      upstream.on('error', () => clientSocket.destroy());
+    });
+    proxyServer.listen(0, '127.0.0.1');
+    await once(proxyServer, 'listening');
+    const proxyAddress = proxyServer.address();
+    if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy test server did not expose a TCP port');
+
+    const sessionKey = `proxy-switch-test-${Date.now()}-${Math.random()}`;
+    const url = `http://127.0.0.1:${address.port}`;
+    const run = async (proxy?: string): Promise<string> => {
+      let text = '';
+      for await (const chunk of streamOpenAIResponsesWebSocket({
+        endpoint: {
+          url,
+          webSocketUrl: `ws://127.0.0.1:${address.port}`,
+          webSocketSessionKey: sessionKey,
+          headers: {},
+          ...(proxy !== undefined ? { proxy } : {}),
+        },
+        url,
+        headers: {},
+        body: { input: [] },
+        format: passthroughFormat,
+      })) {
+        text += chunk.textDelta ?? '';
+      }
+      return text;
+    };
+
+    try {
+      expect(await run()).toBe('ok');
+      expect(proxyConnectCount).toBe(0);
+      expect(targetConnectionCount).toBe(1);
+
+      expect(await run(`http://127.0.0.1:${proxyAddress.port}`)).toBe('ok');
+      expect(proxyConnectCount).toBe(1);
+      expect(targetConnectionCount).toBe(2);
+
+      expect(await run('')).toBe('ok');
+      expect(proxyConnectCount).toBe(1);
+      expect(targetConnectionCount).toBe(3);
+    } finally {
+      for (const client of server.clients) client.terminate();
+      await new Promise<void>((resolve, reject) => proxyServer.close((error) => error ? reject(error) : resolve()));
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });

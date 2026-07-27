@@ -8,6 +8,7 @@
  * longer matches the connection-local state.
  */
 
+import { createHash } from 'node:crypto';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { type RawData } from 'ws';
 import type { LLMProxyOption } from '../config/types.js';
@@ -19,6 +20,7 @@ const OPENAI_RESPONSES_WS_MAX_AGE_MS = 55 * 60 * 1000;
 
 interface WebSocketSession {
   key: string;
+  connectionFingerprint: string;
   socket?: WebSocket;
   connectedAt?: number;
   previousResponseId?: string;
@@ -57,6 +59,12 @@ interface QueuedMessage {
   error?: unknown;
 }
 
+interface NormalizedWebSocketProxy {
+  uri: string;
+  headers?: Record<string, string>;
+  cacheKey: string;
+}
+
 const sessions = new Map<string, WebSocketSession>();
 const webSocketProxyAgents = new Map<string, HttpsProxyAgent<string>>();
 let statelessSessionCounter = 0;
@@ -69,6 +77,7 @@ export async function* streamOpenAIResponsesWebSocket(
   const release = await acquireSessionLock(session, options.signal);
 
   try {
+    synchronizeSessionConnection(session, options.endpoint, options.url, options.headers);
     let allowIncremental = true;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const prepared = prepareCreatePayload(session, fullBody, allowIncremental);
@@ -412,12 +421,26 @@ async function* sendCreateAndReadEvents(
 function sessionFor(endpoint: EndpointConfig, url: string, headers: Record<string, string>): WebSocketSession {
   const configured = endpoint.webSocketSessionKey?.trim();
   const key = configured || `stateless:${++statelessSessionCounter}:${url}:${headers.authorization ?? headers.Authorization ?? ''}`;
+  const connectionFingerprint = webSocketConnectionFingerprint(endpoint, url, headers);
   let session = sessions.get(key);
   if (!session) {
-    session = { key };
+    session = { key, connectionFingerprint };
     sessions.set(key, session);
   }
   return session;
+}
+
+function synchronizeSessionConnection(
+  session: WebSocketSession,
+  endpoint: EndpointConfig,
+  url: string,
+  headers: Record<string, string>,
+): void {
+  const connectionFingerprint = webSocketConnectionFingerprint(endpoint, url, headers);
+  if (session.connectionFingerprint === connectionFingerprint) return;
+  closeSessionSocket(session);
+  invalidateSessionState(session);
+  session.connectionFingerprint = connectionFingerprint;
 }
 
 async function acquireSessionLock(session: WebSocketSession, signal?: AbortSignal): Promise<() => void> {
@@ -566,23 +589,52 @@ function webSocketHeaders(headers: Record<string, string>): Record<string, strin
 }
 
 function webSocketProxyAgent(proxy?: LLMProxyOption): HttpsProxyAgent<string> | undefined {
+  const normalized = normalizeWebSocketProxy(proxy);
+  if (!normalized) return undefined;
+  const cached = webSocketProxyAgents.get(normalized.cacheKey);
+  if (cached) return cached;
+
+  const agent = new HttpsProxyAgent(normalized.uri, {
+    ...(normalized.headers ? { headers: normalized.headers } : {}),
+    rejectUnauthorized: false,
+  });
+  webSocketProxyAgents.set(normalized.cacheKey, agent);
+  return agent;
+}
+
+function normalizeWebSocketProxy(proxy?: LLMProxyOption): NormalizedWebSocketProxy | undefined {
   if (!proxy) return undefined;
   const uri = (typeof proxy === 'string' ? proxy : proxy.url).trim();
   if (!uri) return undefined;
-  const headers = typeof proxy === 'string' ? undefined : proxy.headers;
+  const headers = typeof proxy === 'string' || !proxy.headers || Object.keys(proxy.headers).length === 0
+    ? undefined
+    : proxy.headers;
   const sortedHeaders = headers
     ? Object.fromEntries(Object.entries(headers).sort(([left], [right]) => left.localeCompare(right)))
     : undefined;
-  const cacheKey = JSON.stringify({ uri, headers: sortedHeaders });
-  const cached = webSocketProxyAgents.get(cacheKey);
-  if (cached) return cached;
-
-  const agent = new HttpsProxyAgent(uri, {
+  return {
+    uri,
     ...(headers ? { headers } : {}),
-    rejectUnauthorized: false,
+    cacheKey: JSON.stringify({ uri, headers: sortedHeaders }),
+  };
+}
+
+function webSocketConnectionFingerprint(
+  endpoint: EndpointConfig,
+  url: string,
+  headers: Record<string, string>,
+): string {
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(webSocketHeaders(headers))
+      .map(([key, value]) => [key.toLowerCase(), value] as const)
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
+  const identity = stableStringify({
+    url: toWebSocketUrl(endpoint.webSocketUrl ?? url),
+    headers: normalizedHeaders,
+    proxy: normalizeWebSocketProxy(endpoint.proxy)?.cacheKey ?? null,
   });
-  webSocketProxyAgents.set(cacheKey, agent);
-  return agent;
+  return createHash('sha256').update(identity).digest('hex');
 }
 
 function toWebSocketUrl(url: string): string {

@@ -1,6 +1,6 @@
 {
   "name": "unified-llm-provider",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
   "license": "MIT",
   "type": "module",
