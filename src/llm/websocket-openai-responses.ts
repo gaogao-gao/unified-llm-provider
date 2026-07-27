@@ -78,17 +78,19 @@ export async function* streamOpenAIResponsesWebSocket(
     synchronizeSessionConnection(session, options.endpoint, options.url, options.headers);
     let allowIncremental = true;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      // Continuation state is connection-local. Select or create the socket first so
+      // a replacement connection can invalidate old state before payload preparation.
+      const socket = await ensureOpenSocket(session, options, attempt > 0);
       const prepared = prepareCreatePayload(session, fullBody, allowIncremental);
       let completedResponse: unknown;
       let responseId = responseIdFromPayload(prepared.payload);
       let shouldRetryFull = false;
       const streamedReasoningSignatures: StreamedReasoningSignatureRecord[] = [];
 
-      const socket = await ensureOpenSocket(session, options, attempt > 0);
       const state = options.format.createStreamState();
 
       try {
-        for await (const raw of sendCreateAndReadEvents(socket, prepared.payload, options.signal)) {
+        for await (const raw of sendCreateAndReadEvents(session, socket, prepared.payload, options.signal)) {
           captureStreamedReasoningSignature(raw, streamedReasoningSignatures);
           responseId = responseIdFromPayload(raw) ?? responseId;
           completedResponse = completedResponseFromPayload(raw) ?? completedResponse;
@@ -117,6 +119,7 @@ export async function* streamOpenAIResponsesWebSocket(
         }
       } catch (err) {
         closeSessionSocket(session);
+        invalidateSessionState(session);
         if (isAbortError(options.signal, err)) throw err;
         yield createErrorStreamChunk({
           kind: 'stream_read_error',
@@ -300,11 +303,12 @@ async function ensureOpenSocket(
   forceNew: boolean,
 ): Promise<UndiciWebSocket> {
   const expired = isSessionExpired(session);
-  if (forceNew || expired || !isSocketOpen(session.socket)) {
+  const socketOpen = isSocketOpen(session.socket);
+  if (forceNew || expired || !socketOpen) {
     closeSessionSocket(session);
+    invalidateSessionState(session);
     session.socket = await openSocket(options);
     session.connectedAt = Date.now();
-    if (forceNew || expired) invalidateSessionState(session);
   }
   return session.socket!;
 }
@@ -364,6 +368,7 @@ async function openSocket(options: OpenAIResponsesWebSocketStreamOptions): Promi
 }
 
 async function* sendCreateAndReadEvents(
+  session: WebSocketSession,
   socket: UndiciWebSocket,
   payload: Record<string, unknown>,
   signal?: AbortSignal,
@@ -383,7 +388,7 @@ async function* sendCreateAndReadEvents(
   };
   const onAbort = () => {
     const error = errorFromAbortSignal(signal!);
-    try { socket.close(); } catch { /* noop */ }
+    closeAndInvalidateSessionSocket(session, socket);
     queue.fail(error);
   };
   const onMessage = (event: MessageEvent) => {
@@ -402,7 +407,10 @@ async function* sendCreateAndReadEvents(
     queue.fail(new Error(`OpenAI Responses WebSocket closed: ${event.code} ${event.reason}`.trim()));
   };
 
-  if (signal?.aborted) throw errorFromAbortSignal(signal);
+  if (signal?.aborted) {
+    closeAndInvalidateSessionSocket(session, socket);
+    throw errorFromAbortSignal(signal);
+  }
   signal?.addEventListener('abort', onAbort, { once: true });
   socket.addEventListener('message', onMessage as never);
   socket.addEventListener('error', onError as never, { once: true });
@@ -570,6 +578,15 @@ function invalidateSessionState(session: WebSocketSession): void {
   session.previousResponseId = undefined;
   session.serverInputItems = undefined;
   session.baseSignature = undefined;
+}
+
+function closeAndInvalidateSessionSocket(session: WebSocketSession, socket: UndiciWebSocket): void {
+  if (session.socket === socket) {
+    closeSessionSocket(session);
+    invalidateSessionState(session);
+    return;
+  }
+  try { socket.close(); } catch { /* noop */ }
 }
 
 function isSocketOpen(socket: UndiciWebSocket | undefined): boolean {

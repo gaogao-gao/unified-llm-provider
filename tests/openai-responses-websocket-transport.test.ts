@@ -1,3 +1,4 @@
+import { channel } from 'node:diagnostics_channel';
 import { once } from 'node:events';
 import * as http from 'node:http';
 import * as net from 'node:net';
@@ -25,6 +26,10 @@ describe('OpenAI Responses WebSocket undici transport', () => {
 
     let requestedExtensions: string | undefined;
     let negotiatedExtensions: string | undefined;
+    const undiciOpenEvents: unknown[] = [];
+    const undiciOpenChannel = channel('undici:websocket:open');
+    const onUndiciOpen = (event: unknown) => undiciOpenEvents.push(event);
+    undiciOpenChannel.subscribe(onUndiciOpen);
     server.once('headers', (_headers, request) => {
       requestedExtensions = request.headers['sec-websocket-extensions'];
     });
@@ -67,11 +72,16 @@ describe('OpenAI Responses WebSocket undici transport', () => {
         text += chunk.textDelta ?? '';
       }
     } finally {
+      undiciOpenChannel.unsubscribe(onUndiciOpen);
       for (const client of server.clients) client.terminate();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
 
     expect(text).toBe('0123456789'.repeat(5));
+    const undiciOpen = undiciOpenEvents[0] as { websocket?: unknown; handshakeResponse?: { status?: number; headers?: unknown } } | undefined;
+    expect(undiciOpen?.websocket).toBeDefined();
+    expect(undiciOpen?.handshakeResponse?.status).toBe(101);
+    expect(undiciOpen?.handshakeResponse?.headers).toBeDefined();
     expect(requestedExtensions).toBeUndefined();
     expect(negotiatedExtensions).toBe('');
     expect(performance.now() - startedAt).toBeLessThan(1_000);
@@ -172,6 +182,79 @@ describe('OpenAI Responses WebSocket undici transport', () => {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
 
+  });
+
+  it('closes an aborted socket and sends the next turn on a new connection with full local context', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('WebSocket test server did not expose a TCP port');
+
+    const payloads: Array<{ connection: number; payload: Record<string, unknown> }> = [];
+    let connectionCount = 0;
+    let resolveInterruptedRequest!: () => void;
+    const interruptedRequestReceived = new Promise<void>((resolve) => { resolveInterruptedRequest = resolve; });
+    server.on('connection', (socket) => {
+      const connection = ++connectionCount;
+      socket.on('message', (data) => {
+        const payload = JSON.parse(data.toString()) as Record<string, unknown>;
+        payloads.push({ connection, payload });
+        if (payloads.length === 1) {
+          socket.send(JSON.stringify({ type: 'response.completed', response: { id: 'resp_seed', output: [] } }));
+        } else if (payloads.length === 2) {
+          resolveInterruptedRequest();
+        } else if (payloads.length === 3) {
+          socket.send(JSON.stringify({ type: 'response.completed', response: { id: 'resp_after_interrupt', output: [] } }));
+        }
+      });
+    });
+
+    const sessionKey = `abort-reconnect-${Date.now()}-${Math.random()}`;
+    const url = `http://127.0.0.1:${address.port}`;
+    const inputItem = (text: string) => ({ role: 'user', content: [{ type: 'input_text', text }] });
+    const firstInput = inputItem('first');
+    const secondInput = inputItem('second');
+    const interruptInput = inputItem('[Background command exited] done');
+    const consume = async (input: unknown[], signal?: AbortSignal): Promise<void> => {
+      for await (const _chunk of streamOpenAIResponsesWebSocket({
+        endpoint: {
+          url,
+          webSocketUrl: `ws://127.0.0.1:${address.port}`,
+          webSocketSessionKey: sessionKey,
+          headers: {},
+        },
+        url,
+        headers: {},
+        body: { input },
+        format: passthroughFormat,
+        signal,
+      })) {
+        // Consume until the response completes or the caller aborts it.
+      }
+    };
+
+    try {
+      await consume([firstInput]);
+
+      const controller = new AbortController();
+      const interrupted = consume([firstInput, secondInput], controller.signal);
+      await interruptedRequestReceived;
+      controller.abort(new Error('test interrupt'));
+      await expect(interrupted).rejects.toThrow('test interrupt');
+
+      await consume([firstInput, secondInput, interruptInput]);
+
+      expect(connectionCount).toBe(2);
+      expect(payloads).toHaveLength(3);
+      expect(payloads[0]).toMatchObject({ connection: 1, payload: { input: [firstInput] } });
+      expect(payloads[0].payload.previous_response_id).toBeUndefined();
+      expect(payloads[1]).toMatchObject({ connection: 1, payload: { input: [secondInput], previous_response_id: 'resp_seed' } });
+      expect(payloads[2]).toMatchObject({ connection: 2, payload: { input: [firstInput, secondInput, interruptInput] } });
+      expect(payloads[2].payload.previous_response_id).toBeUndefined();
+    } finally {
+      for (const client of server.clients) client.terminate();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 
   it('fails instead of falling back to a direct socket when the proxy is unavailable', async () => {
